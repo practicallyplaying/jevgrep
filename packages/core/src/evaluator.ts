@@ -43,7 +43,8 @@ export function createEvaluator(options: {
 }) {
   const endpoint = endpointFor(options);
   const concurrency = options.concurrency ?? 32;
-  const timeoutMs = options.timeoutMs ?? (options.provider === "typesafe" ? 60_000 : 15_000);
+  const timeoutMs =
+    options.timeoutMs ?? (options.provider === "typesafe" || options.provider === "laya" ? 60_000 : 15_000);
   if (!Number.isSafeInteger(concurrency) || concurrency < 1)
     throw new Error("Concurrency must be a positive integer");
   let requests = 0;
@@ -103,6 +104,58 @@ export function createEvaluator(options: {
       return response;
     },
   });
+  async function evaluateWithLaya(request: EvaluationRequest): Promise<Record<string, number>> {
+    assertActive();
+    if (requests >= (options.requestLimit ?? 50_000)) throw new EvaluationFailure("request-limit");
+    requests++;
+    const state = truncateState(request.state);
+    const questions = Object.fromEntries(
+      Object.entries(request.questions).map(([id, question]) => [
+        id,
+        {
+          type: "choice",
+          prompt: question.instructions,
+          instructions: question.instructions,
+          criteria: {
+            yes: `Yes: ${question.instructions}`,
+            no: `No: ${question.instructions}`,
+          },
+        },
+      ]),
+    );
+    const response = await (options.fetch ?? fetch)(`${endpoint.baseURL}/judge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ state, questions }),
+      signal: AbortSignal.any([
+        options.signal,
+        authenticationFailure.signal,
+        AbortSignal.timeout(timeoutMs),
+      ]),
+    });
+    if (!response.ok) {
+      const message = stripVTControlCharacters((await response.text()).slice(0, 300));
+      throw new EvaluationFailure("provider", false, { statusCode: response.status, message });
+    }
+    const result = (await response.json()) as {
+      answers?: Record<
+        string,
+        | { type?: string; probability?: unknown; noul?: unknown; probabilities?: Record<string, unknown> }
+        | string
+      >;
+      usage?: { input_tokens?: unknown; inputTokens?: unknown };
+    };
+    const answers = result.answers;
+    if (!answers || typeof answers !== "object") throw new Error("Invalid Laya response");
+    return Object.fromEntries(
+      Object.keys(request.questions).map((id) => {
+        const probability = layaProbability(answers[id]);
+        if (!Number.isFinite(probability) || probability < 0 || probability > 1)
+          throw new Error("Invalid Laya answer");
+        return [id, probability];
+      }),
+    );
+  }
   return {
     get cacheHits() {
       return cacheHits;
@@ -145,6 +198,13 @@ export function createEvaluator(options: {
         return cached;
       }
       const navigation = policy?.navigation === true;
+      if (options.provider === "laya") {
+        await policy?.beforeAttempt?.();
+        assertActive();
+        const scores = await evaluateWithLaya(request);
+        await options.cache?.put(cacheInput, scores);
+        return scores;
+      }
       const reservedTokens = rateBudget ? estimatedInputTokens(request) : 0;
       const multiple = Object.keys(request.questions).length > 1;
       let attemptLimit = navigation && multiple ? 1 : 2;
@@ -256,6 +316,28 @@ export function createEvaluator(options: {
       throw new EvaluationFailure("provider");
     },
   };
+}
+
+function truncateState(state: unknown): string {
+  const text = typeof state === "string" ? state : JSON.stringify(state);
+  const maxChars = 1800;
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n[truncated for Laya 512-token context]`;
+}
+
+function layaProbability(answer: unknown): number {
+  if (typeof answer === "string") return /^yes$/i.test(answer) ? 1 : /^no$/i.test(answer) ? 0 : NaN;
+  if (!answer || typeof answer !== "object") return NaN;
+  const direct = "probability" in answer ? answer.probability : "noul" in answer ? answer.noul : undefined;
+  if (typeof direct === "number") return direct;
+  const probabilities =
+    "probabilities" in answer && answer.probabilities && typeof answer.probabilities === "object"
+      ? (answer.probabilities as Record<string, unknown>)
+      : undefined;
+  const yes = probabilities?.yes ?? probabilities?.true;
+  if (typeof yes === "number") return yes;
+  const value = "value" in answer ? answer.value : "choice" in answer ? answer.choice : undefined;
+  return typeof value === "string" ? layaProbability(value) : NaN;
 }
 
 // Only explicit text fields from a parsed provider error are suitable for user-facing diagnostics.

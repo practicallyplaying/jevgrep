@@ -40,6 +40,59 @@ test("Jev uses native state and validated boolean probabilities through real HTT
   }
 });
 
+test("Laya provider posts boolean batches to the local judge endpoint", async () => {
+  const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const server = Bun.serve({
+    port: 0,
+    async fetch(request) {
+      requests.push({
+        path: new URL(request.url).pathname,
+        body: (await request.json()) as Record<string, unknown>,
+      });
+      return Response.json({
+        answers: {
+          useful: { type: "choice", probabilities: { yes: 0.75, no: 0.25 } },
+        },
+        usage: { input_tokens: 42 },
+      });
+    },
+  });
+  try {
+    const evaluator = createEvaluator({
+      apiKey: "local",
+      provider: "laya",
+      fetch: (input, init) => fetch(`http://127.0.0.1:${server.port}${new URL(String(input)).pathname}`, init),
+      signal: new AbortController().signal,
+    });
+    const result = await evaluator.evaluate({
+      state: { query: "find event recording", source: "recordEvent()" },
+      questions: { useful: { type: "boolean", instructions: "Is the source useful?" } },
+    });
+    expect(result).toEqual({ useful: 0.75 });
+    expect(requests).toEqual([
+      {
+        path: "/judge",
+        body: {
+          state: JSON.stringify({ query: "find event recording", source: "recordEvent()" }),
+          questions: {
+            useful: {
+              type: "choice",
+              prompt: "Is the source useful?",
+              instructions: "Is the source useful?",
+              criteria: {
+                yes: "Yes: Is the source useful?",
+                no: "No: Is the source useful?",
+              },
+            },
+          },
+        },
+      },
+    ]);
+  } finally {
+    server.stop(true);
+  }
+});
+
 test("transient failures retry within the shared request guard and never become scores", async () => {
   let calls = 0;
   const server = Bun.serve({

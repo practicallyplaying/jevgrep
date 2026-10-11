@@ -19,6 +19,11 @@ export const providers = {
     baseURL: "https://opencode.ai/zen/v1",
     model: "jev-1.13",
   },
+  laya: {
+    label: "Laya local",
+    baseURL: "http://127.0.0.1:8793",
+    model: "laya-local",
+  },
 } as const;
 
 export type ProviderId = keyof typeof providers;
